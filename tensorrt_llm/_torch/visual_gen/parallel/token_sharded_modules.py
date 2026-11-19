@@ -45,6 +45,7 @@ from ...modules.linear import Linear, TensorParallelMode
 from ...modules.mlp import MLP
 from ..modules.attention import Attention, QKVMode
 from ..modules.rms_norm import RMSNormTPAware
+from .token_sharded_shared_input import SharedTokenShardedInput
 from .token_sharded_tp import fp8_block_scale_prequant_ok
 
 if TYPE_CHECKING:
@@ -119,7 +120,12 @@ class TokenShardedColumn(TokenShardedAdapter):
         tp = self._token_sharded_tp
         # An active LoRA (Linear.forward's lora_params) applies its adapters to the dense input.
         lora_params = kwargs.get("lora_params")
-        if tp.uses_ce_gather(self, input, lora_params):
+        if isinstance(input, SharedTokenShardedInput):
+            if args:
+                raise TypeError("shared column inputs require keyword-only options")
+            value = input.for_consumer(self, tp, lora_params)
+            out = value if input.outputs else super().forward(value, *args, **kwargs)
+        elif tp.uses_ce_gather(self, input, lora_params):
             out = tp.ce_gather_gemm(self, input)
         else:
             gathered = tp.gather_input(self, input, prequantize=not lora_params)
@@ -177,6 +183,10 @@ class TokenShardedMLP(TokenShardedAdapter):
     (the NCCL modes, an active LoRA, other quantizations, a ``GatedMLP`` with its fused
     gate-up paths) is ``MLP.forward`` / ``GatedMLP.forward`` on the gathered input and the NCCL
     reduce-scatter, byte for byte the NCCL-mode code.
+
+    An explicit shared input bypasses the adapter's gather. A plain MLP retains the same
+    down-projection dispatch on the shared up-projection result or gathered activation;
+    a GatedMLP runs its activation/down-projection tail and the NCCL reduce-scatter.
     """
 
     @classmethod
@@ -187,8 +197,8 @@ class TokenShardedMLP(TokenShardedAdapter):
         _check_linear(getattr(module, up, None), f"{name}.{up}", TensorParallelMode.COLUMN, tp)
         _check_linear(module.down_proj, f"{name}.down_proj", TensorParallelMode.ROW, tp)
         _stop_all_reduce(module.down_proj, f"{name}.down_proj")
-        if isinstance(module, MLP):  # a GatedMLP's projections never take the fused ops
-            tp.note_consumer(module.up_proj)
+        tp.note_consumer(getattr(module, up))
+        if isinstance(module, MLP):
             tp.note_row_consumer(module.down_proj)
 
     def forward(self, x, *args, **kwargs):
@@ -202,7 +212,24 @@ class TokenShardedMLP(TokenShardedAdapter):
             lora_params = args[0]
         else:
             lora_params = kwargs.get("lora_params")
-        if isinstance(self, MLP) and tp.uses_ce_gather(consumer, x, lora_params):
+        if isinstance(x, SharedTokenShardedInput):
+            if not isinstance(self, MLP) and len(args) >= 3:
+                lora_params = args[2]
+            value = x.for_consumer(self, tp, lora_params)
+            if isinstance(self, MLP) and x.outputs:
+                x_act = self._act_from_up(value)
+            elif isinstance(self, MLP) and self._owns_down_proj_for_ce_reduce_scatter(lora_params):
+                x_act = self._act_from_up(self.up_proj(value))
+            else:
+                if x.outputs:
+                    final_params = (
+                        args[1] if len(args) >= 2 else kwargs.get("final_all_reduce_params")
+                    )
+                    partial = self._down_from_gate_up(value, final_params)
+                else:
+                    partial = super().forward(value, *args, **kwargs)
+                return tp.local_view(tp.reduce_scatter(partial))
+        elif isinstance(self, MLP) and tp.uses_ce_gather(consumer, x, lora_params):
             x_act = self._ce_up_and_activation(x)
         elif isinstance(self, MLP) and self._owns_down_proj_for_ce_reduce_scatter(lora_params):
             x_act = self._act_from_up(self.up_proj(tp.gather_input(consumer, x)))
