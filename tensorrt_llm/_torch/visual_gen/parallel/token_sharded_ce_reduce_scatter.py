@@ -22,9 +22,14 @@ the padded stream is exactly destination ``d``'s rows (``TokenShardPlan.row_star
 and each remote block is *pushed* straight into the destination's region of a symmetric-memory
 slot with one copy-engine ``cudaMemcpyAsync`` on a side stream (no SMs) as soon as its GEMM is
 enqueued; the own block is computed last, directly into the own region, while the pushes are
-in flight. After the ``tp - 1`` ready flags one kernel reduces the ``[tp, m, N]`` view of the
-slot in fixed source-rank order (fp32 adds, one bf16 rounding). The whole boundary is one custom
+in flight. After the ``tp - 1`` ready flags one kernel reduces the chunk's landed partials in
+fixed source-rank order (fp32 adds, one bf16 rounding). The whole boundary is one custom
 op (``trtllm::token_sharded_fp8_ce_gemm_reduce_scatter``) so a compiled block stays one graph.
+
+Destination blocks are processed in rounds of at most :data:`CHUNK_ROWS` rows. A round
+finishes its reduce and joins every push before the next round reuses the slot and staging
+buffer; a tail round uses its actual row count. At fixed TP and output width, both buffers
+are bounded independently of token count. The returned output still has ``m`` rows.
 
 Protocol (rank ``r``, one boundary on slot ``s``)
 --------------------------------------------------
@@ -43,10 +48,9 @@ every source in :attr:`CeReduceScatter.wait_order` (``r + 1, r + 2, ...``, the a
 :func:`fixed_order_reduce_bf16` reduces :meth:`CeReduceScatter.partials`;
 :meth:`CeReduceScatter.done` joins every side stream into the current stream and signals
 ``consumed(s)`` to every peer. Channels: ``ready(s) = s``, ``consumed(s) = slots + s``. One slot
-by default: the only cross-boundary dependency is the producer's ``consumed`` wait on its side
-stream, and the destination signals ``consumed`` right after its reduce while the next row
-boundary is an attention or an MLP away, so a slow destination stalls a producer's side stream,
-never its compute stream.
+by default: the producer waits for ``consumed`` on its side stream, and the destination signals
+``consumed`` right after its reduce. The next chunk's GEMM can run while a remote destination
+finishes reducing the previous chunk; its push waits before overwriting that destination's slot.
 
 Every wait is satisfiable: ``ready(s)`` of boundary ``b`` is put by every producer inside its
 ``push(b)``, enqueued on side streams that only wait for ``consumed(s)`` of ``b - slots``, which
@@ -175,6 +179,7 @@ if TYPE_CHECKING:
     from .token_sharded_tp import TokenShardPlan
 
 __all__ = [
+    "CHUNK_ROWS",
     "DEFAULT_ALIGN",
     "DEFAULT_TIMEOUT_MS",
     "REDUCE_BLOCK",
@@ -193,8 +198,13 @@ __all__ = [
 ]
 
 SLOTS = 1
-"""int: Slots the reduce-scatter transport alternates over (1: the slot is 1.55 GB at TP4 B=2
-and the producer's ``consumed`` wait sits on its side stream; see the module docstring)."""
+"""int: Slots the reduce-scatter transport alternates over."""
+
+CHUNK_ROWS = 8192
+"""Maximum rows per destination in a transport round. At TP4, N=5120 the slot is
+320 MiB and staging is 240 MiB, independent of the token count. Output and quantized
+input storage still scale with tokens. Each round joins its pushes before staging is reused.
+"""
 
 REDUCE_BLOCK = 2048
 """int: Elements per program of the fixed-order reduce kernel (fixed launch config, no
@@ -957,7 +967,8 @@ class CeReduceScatterState:
 
         Eager, every rank in the same order (``TokenShardedTP.begin``). Checks that the
         previous boundary chain is complete and restarts the slots at 0 (:meth:`begin_forward`,
-        so the caller need not call it), then sizes the pool for ``plan.local_rows`` x the
+        so the caller need not call it), then sizes the pool for
+        ``min(plan.local_rows, CHUNK_ROWS)`` x the
         largest noted consumer ``N``, grow-only. Under CUDA-graph capture only the slot counter
         is reset; a probe or an allocation under capture raises, as does a closed state.
         """
@@ -979,7 +990,7 @@ class CeReduceScatterState:
         self.begin_forward()
         if not self.consumer_ns:
             return
-        layout = Bf16RowsRegionLayout(plan.local_rows, max(self.consumer_ns))
+        layout = Bf16RowsRegionLayout(min(plan.local_rows, CHUNK_ROWS), max(self.consumer_ns))
         if self.transport.covers(layout):
             return
         if capturing:
@@ -1133,7 +1144,8 @@ def ce_gemm_reduce_scatter_impl(
     stream: for each destination in ``transport.dest_order`` the GEMM of its row block into a
     transient staging tensor, then its push (side stream); the own block's GEMM straight into
     the own region; the ``tp - 1`` ready waits; the reduce with ``bias`` on source 0; the join
-    and the consumed signals.
+    and the consumed signals. Repeat over at most CHUNK_ROWS rows per destination, reusing
+    staging only after done() joins every push; write reduced chunks into the full output.
 
     Args:
         x_fp8: The padded ``[batch_size * padded_seq_len, K_local]`` float8_e4m3fn row-path
@@ -1141,8 +1153,8 @@ def ce_gemm_reduce_scatter_impl(
         x_sf: Its ``(batch_size * padded_seq_len, P)`` int32 packed UE8M0 scales, any stride.
         w_fp8: The row Linear's ``[N, K_local]`` float8_e4m3fn weight.
         w_sf: Its packed int32 weight scale.
-        bias: The row Linear's ``[N]`` bf16 bias on ``tp_rank`` 0, None elsewhere and when the
-            Linear has none (added inside the reduce to source 0's partial).
+        bias: The replicated row Linear's ``[N]`` bf16 bias on every rank, or None when the
+            Linear has none. Each destination uses bf16(p0 + bias) as source 0's partial.
         group_name: The TP group's c10d name (the registry key).
         tp_rank: This rank in the group.
         tp_size: Ranks in the group.
@@ -1183,34 +1195,40 @@ def ce_gemm_reduce_scatter_impl(
     m = padded_rows // tp_size
     _check_op_operands(x_fp8, x_sf, w_fp8, w_sf, bias, padded_rows)
     n = w_fp8.shape[0]
-    layout = Bf16RowsRegionLayout(m, n)
+    chunk_rows = min(m, CHUNK_ROWS)
+    layout = Bf16RowsRegionLayout(chunk_rows, n)
     if not transport.covers(layout):
         # Eager backstop (rank-symmetric: every rank calls the op with the same plan ints and
         # N): a consumer whose N was not noted before begin(). Under capture the pool raises.
         logger.info(
-            f"Token-sharded TP ({group_name}): sizing the reduce-scatter pool for [{m}, {n}] at "
+            f"Token-sharded TP ({group_name}): sizing the reduce-scatter pool for "
+            f"[{chunk_rows}, {n}] at "
             "the op's first eager call; note the consumer's out_features before begin() to "
             "reserve eagerly."
         )
         transport.reserve(layout)
     x_fp8 = x_fp8.contiguous()
-    slot = state.next_slot()
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x_fp8.device)
+    staging = torch.empty(
+        ((tp_size - 1) * chunk_rows, n), dtype=torch.bfloat16, device=x_fp8.device
+    )
     try:
-        transport.begin(slot, layout)
-        staging = torch.empty(((tp_size - 1) * m, n), dtype=torch.bfloat16, device=x_fp8.device)
-        for i, dst in enumerate(transport.dest_order):
-            rows = slice(dst * m, (dst + 1) * m)
-            block = staging[i * m : (i + 1) * m]
-            fp8_block_gemm_out(x_fp8[rows], mn_major_scales(x_sf[rows]), w_fp8, w_sf, block)
-            transport.push(dst, slot, block)
-        rows = slice(tp_rank * m, (tp_rank + 1) * m)
-        fp8_block_gemm_out(
-            x_fp8[rows], mn_major_scales(x_sf[rows]), w_fp8, w_sf, transport.own_view(slot)
-        )
-        transport.wait_all(slot)
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x_fp8.device)
-        fixed_order_reduce_bf16(transport.partials(slot), bias, out)
-        transport.done(slot)
+        for start in range(0, m, chunk_rows):
+            count = min(chunk_rows, m - start)
+            slot = state.next_slot()
+            transport.begin(slot, Bf16RowsRegionLayout(count, n))
+            for i, dst in enumerate(transport.dest_order):
+                rows = slice(dst * m + start, dst * m + start + count)
+                block = staging[i * chunk_rows : i * chunk_rows + count]
+                fp8_block_gemm_out(x_fp8[rows], mn_major_scales(x_sf[rows]), w_fp8, w_sf, block)
+                transport.push(dst, slot, block)
+            rows = slice(tp_rank * m + start, tp_rank * m + start + count)
+            fp8_block_gemm_out(
+                x_fp8[rows], mn_major_scales(x_sf[rows]), w_fp8, w_sf, transport.own_view(slot)
+            )
+            transport.wait_all(slot)
+            fixed_order_reduce_bf16(transport.partials(slot), bias, out[start : start + count])
+            transport.done(slot)
     except Exception:
         transport.reset()
         raise

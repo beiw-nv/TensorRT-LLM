@@ -95,6 +95,7 @@ __all__ = [
     "DEFAULT_GATHER_MODE",
     "DEFAULT_REDUCE_SCATTER_MODE",
     "FP8_BLOCK_SIZE",
+    "MIN_CE_REDUCE_SCATTER_ROWS",
     "GATHER_MODES",
     "REDUCE_SCATTER_MODES",
     "Fp8BlockScaledActivation",
@@ -115,6 +116,14 @@ __all__ = [
 ]
 
 FP8_BLOCK_SIZE = 128
+
+MIN_CE_REDUCE_SCATTER_ROWS = 8192
+"""Minimum rows per destination GEMM for biased FP8 row projections.
+
+Smaller shards and bias-free projections use the whole-M GEMM and NCCL reduce-scatter.
+This internal cutoff is rank-independent and shape-only, so dispatch stays identical on
+every rank and under capture.
+"""
 
 GatherMode = Literal["nccl", "copy_engine"]
 """The column-projection input gathers a :class:`TokenShardedTP` can run."""
@@ -1155,12 +1164,18 @@ class TokenShardedTP:
         ``K_local``), no LoRA is active (``lora_params`` falsy; an active LoRA needs the
         module's own forward) and ``act`` is a bf16 tensor (the fused op quantizes it with the
         pinned 1x128 quantizer). Anything else (NVFP4 and bf16 row consumers, pre-quantized
-        inputs) takes the module's GEMM and :meth:`reduce_scatter` as in the NCCL mode.
+        inputs, bias-free projections, or fewer than :data:`MIN_CE_REDUCE_SCATTER_ROWS`
+        rows per destination)
+        takes the module's GEMM and :meth:`reduce_scatter` as in the NCCL mode.
         Decided per call: the quant method is final only after loading.
         """
         if self.effective_reduce_scatter_mode != "copy_engine" or lora_params:
             return False
+        if self.plan.local_rows < MIN_CE_REDUCE_SCATTER_ROWS:
+            return False
         if not fp8_block_scale_prequant_ok(consumer):
+            return False
+        if consumer.bias is None:
             return False
         return isinstance(act, torch.Tensor) and act.dtype == torch.bfloat16
 

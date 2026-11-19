@@ -31,6 +31,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import functools
 import sys
 import traceback
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1573,8 +1574,8 @@ def _fp8_row_linear(rank, world_size, device, k_local, n, seed):
 
 def _logic_ce_reduce_scatter_op(rank, world_size, device):
     """The fused op ``trtllm::token_sharded_fp8_ce_gemm_reduce_scatter`` on real FP8 block-scale
-    row Linears (K_local 1280 / 3456, N 5120) over the plans of ``_FP8_SHAPES`` and an 18,900-row
-    shard (37,800 at tp 2): bitwise the explicit fp32 chain over the all-to-all'd bf16 partials
+    row Linears (K_local 1280 / 3456, N 5120) over small-M and 32K/64K-token plans, including
+    a one-row tail chunk: bitwise the explicit fp32 chain over the all-to-all'd bf16 partials
     with the bias entering as rank 0's bf16 partial carries it (A), within design 5.2's bound of
     NCCL's reduce-scatter of PR #9's partials and bitwise at tp = 2 (C), deterministic over 24
     boundaries with a rotating source's push to a rotating destination delayed on its side
@@ -1624,7 +1625,7 @@ def _logic_ce_reduce_scatter_op(rank, world_size, device):
         c5 = op(fp8, sf, row, row.bias if with_bias else None, plan)  # every rank passes the bias
         return fp8, sf, raw, pr9, c5
 
-    shapes = _FP8_SHAPES + [(1, 18900 * world_size)] + ([(2, 37800)] if world_size == 2 else [])
+    shapes = _FP8_SHAPES + [(1, 768), (1, (rs.CHUNK_ROWS + 1) * world_size), (1, 32768), (1, 65536)]
     pool_bytes = []
     for b, s in shapes:
         plan = tp.begin(b, s)
@@ -1758,6 +1759,11 @@ def _logic_ce_reduce_scatter_op(rank, world_size, device):
 
     # The pool: sized by the forwards, grow-only, never shrinking for a smaller shape.
     _check(
+        pool_bytes[-1] == pool_bytes[-2] == pool_bytes[-3],
+        f"the reduce-scatter pool grew past the row chunk: {pool_bytes}",
+        device,
+    )
+    _check(
         all(a <= b for a, b in zip(pool_bytes, pool_bytes[1:])) and pool_bytes[-1] > pool_bytes[0],
         f"the reduce-scatter pool did not grow monotonically: {pool_bytes}",
         device,
@@ -1779,6 +1785,7 @@ def _logic_ce_reduce_scatter_op(rank, world_size, device):
         op(fp8, sf, row, None, plan)
 
 
+@patch("tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp.MIN_CE_REDUCE_SCATTER_ROWS", 0)
 def _logic_adapters_ce_reduce_scatter(rank, world_size, device):
     """FP8 block-scale row Linear and MLP converted with ``reduce_scatter_mode="copy_engine"``
     (and the copy-engine gather: both pools alive in one group) against the NCCL adapters: the
@@ -1947,6 +1954,21 @@ def _logic_adapters_ce_reduce_scatter(rank, world_size, device):
             f"(NCCL MLP compiled vs eager: {drift_ref:.3e})",
             device,
         )
+    # Exercise production dispatch for the real-time shape and a larger bias-free projection.
+    with patch(
+        "tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp.MIN_CE_REDUCE_SCATTER_ROWS", 8192
+    ):
+        for tokens in (768, world_size * 8192):
+            if tokens != 768:
+                row_ce.bias = row_ref.bias = None
+            _, x_row = inputs(1, tokens, 1234)
+            tp_ref.begin(1, tokens)
+            tp_ce.begin(1, tokens)
+            scattered = _spy_reduce_scatter(tp_ce)
+            got = row_ce(x_row)
+            _check(len(scattered) == 1, "fallback row adapter bypassed NCCL", device)
+            _check(torch.equal(got, row_ref(x_row)), "fallback != NCCL row adapter", device)
+            del tp_ce.reduce_scatter
     tp_ce.close()
     tp_ce.close()  # idempotent
 
@@ -2016,6 +2038,7 @@ def _check_rs_modes(tp, device):
     )
 
 
+@patch("tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp.MIN_CE_REDUCE_SCATTER_ROWS", 0)
 def _logic_compile_fullgraph_ce_rs(rank, world_size, device):
     """torch.compile(fullgraph=True) of a gather + reduce-scatter chain with both copy-engine
     modes on: one graph (the fused ops are opaque), the column and reduce-scatter outputs
@@ -2064,6 +2087,7 @@ def _logic_compile_fullgraph_ce_rs(rank, world_size, device):
     tp.close()
 
 
+@patch("tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp.MIN_CE_REDUCE_SCATTER_ROWS", 0)
 def _logic_cuda_graph_ce_rs(rank, world_size, device):
     """CUDA-graph capture + replay of a gather + reduce-scatter chain with both copy-engine
     modes on: begin() reserves both pools eagerly, two eager boundaries precede the capture (the
@@ -2075,7 +2099,7 @@ def _logic_cuda_graph_ce_rs(rank, world_size, device):
     d = 256
     tp, col, row = _fp8_rs_chain_parts(rank, world_size, device, d)
     chain = _make_rs_chain(tp, col, row)
-    for b, s in [(2, 256), (2, 5), (1, 5), (1, 418)]:
+    for b, s in [(1, (rs.CHUNK_ROWS + 1) * world_size), (2, 256), (2, 5), (1, 5), (1, 418)]:
         plan = tp.begin(b, s)  # eager: probes once, sizes both pools for this shape
         _check_rs_modes(tp, device)
         args = _fp8_chain_inputs(tp, b, s, d, device)
@@ -2115,7 +2139,7 @@ def _logic_cuda_graph_ce_rs(rank, world_size, device):
         _check(ok, f"CE RS CUDA graph second replay vs eager {(b, s)}", device)
         del graph
     with pytest.raises(RuntimeError, match="CUDA graph"):
-        tp.begin(2, 512)
+        tp.begin(1, (rs.CHUNK_ROWS + 2) * world_size)
     tp.close()
 
 

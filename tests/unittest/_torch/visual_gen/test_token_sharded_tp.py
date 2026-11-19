@@ -64,6 +64,35 @@ from tensorrt_llm.visual_gen.args import ParallelConfig
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _exercise_ce_for_small_correctness_shapes(monkeypatch):
+    monkeypatch.setattr(token_sharded_tp, "MIN_CE_REDUCE_SCATTER_ROWS", 0)
+
+
+@pytest.mark.parametrize(
+    "tokens,bias,expected",
+    [
+        (768, True, False),
+        (32764, True, False),
+        (32768, True, True),
+        (65536, True, True),
+        (32768, False, False),
+        (65536, False, False),
+    ],
+)
+def test_ce_reduce_scatter_small_m_fallback(tokens, bias, expected, monkeypatch):
+    monkeypatch.setattr(token_sharded_tp, "MIN_CE_REDUCE_SCATTER_ROWS", 8192)
+    monkeypatch.setattr(token_sharded_tp, "is_sm_100f", lambda: True)
+    consumer = _fp8_row_linear(bias=bias)
+    x = torch.zeros(tokens, 256, dtype=torch.bfloat16)
+    for rank in range(4):
+        ts = simulated_helper(
+            TokenShardPlan.build(1, tokens, 4, rank), reduce_scatter_mode="copy_engine"
+        )
+        ts._rs_state = SimpleNamespace(effective=True, reason="")
+        assert ts.uses_ce_reduce_scatter(consumer, x) is expected
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -844,7 +873,7 @@ def _fake_rs_module(monkeypatch, probe_ok, warnings=None):
     return mod, warnings, validated
 
 
-def _fp8_row_linear(k_local=256, n=128, bias=False, **kwargs):
+def _fp8_row_linear(k_local=256, n=128, bias=True, **kwargs):
     """An FP8 block-scale row-parallel Linear as a converted block carries it (tp_size=2,
     its all-reduce stopped)."""
     lin = Linear(
@@ -1083,7 +1112,7 @@ def test_ce_reduce_scatter_lifecycle_effective(monkeypatch):
 def test_ce_gemm_reduce_scatter_traced_part(batch, seq, tp, monkeypatch):
     """The traced part of the fused reduce-scatter: the input is padded per sample and
     quantized once on all rows, the op gets the plan's ints and the group name, and the bias
-    enters on rank 0 only (the NCCL path's placement); other ranks pass None."""
+    is passed on every rank so each destination applies it once to source 0's partial."""
     monkeypatch.setattr(token_sharded_tp, "is_sm_100f", lambda: True)
     quantized, op_calls = [], []
 
@@ -1129,11 +1158,12 @@ def test_ce_gemm_reduce_scatter_traced_part(batch, seq, tp, monkeypatch):
         assert ts.local_view(out).shape == (len(plan.entry_batch), plan.rows_per_entry, n)
     assert len(op_calls) == tp
     # A Linear without a bias passes None on every rank.
-    no_bias = _fp8_row_linear(k_local, n)
+    no_bias = _fp8_row_linear(k_local, n, bias=False)
     ts = simulated_helper(
         TokenShardPlan.build(batch, seq, tp, 0), reduce_scatter_mode="copy_engine"
     )
     ts._rs_state = SimpleNamespace(effective=True, reason="")
+    assert not ts.uses_ce_reduce_scatter(no_bias, x)
     ts.ce_gemm_reduce_scatter(no_bias, x)
     assert op_calls[-1][4] is None
     # The padded stream is not accepted as the input (the op pads itself).
