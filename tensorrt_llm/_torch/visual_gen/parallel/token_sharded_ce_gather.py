@@ -120,6 +120,7 @@ __all__ = [
     "CeGatherState",
     "RegionLayout",
     "ce_gather_gemm_impl",
+    "ce_gather_gemms_impl",
     "drop_padding",
     "fp8_block_gemm_out",
     "get_state",
@@ -711,10 +712,37 @@ def ce_gather_gemm_impl(
     seq_len: int,
     padded_seq_len: int,
 ) -> torch.Tensor:
-    """Body of ``trtllm::token_sharded_fp8_ce_gather_gemm``: issue, GEMM per source, done.
+    """One projection using the shared copy-engine gather protocol."""
+    return ce_gather_gemms_impl(
+        x_fp8,
+        x_sf,
+        [w_fp8],
+        [w_sf],
+        group_name,
+        tp_rank,
+        tp_size,
+        batch_size,
+        seq_len,
+        padded_seq_len,
+    )[0]
+
+
+def ce_gather_gemms_impl(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: list[torch.Tensor],
+    weight_scales: list[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> list[torch.Tensor]:
+    """One exchange, all consumer GEMMs per source, then release the shared slot.
 
     Returns the ``[batch_size * seq_len, N]`` bf16 GEMM output of every rank's real rows (pad
-    rows dropped), without bias. Order on the current stream: own chunk's GEMM, then each
+    rows dropped), without bias, for each weight. Order on the current stream: own chunk, then each
     remote source in ``transport.consume_order`` after a stream wait for its arrival, each into
     its row block ``out[src * m:(src + 1) * m]`` of the padded ``[tp_size * m, N]`` output.
 
@@ -722,8 +750,8 @@ def ce_gather_gemm_impl(
         x_fp8: This rank's ``[m, K]`` float8_e4m3fn rows, ``m = batch_size * padded_seq_len /
             tp_size``.
         x_sf: Their ``(m, P)`` int32 packed UE8M0 scales.
-        w_fp8: The consumer's ``[N, K]`` float8_e4m3fn weight.
-        w_sf: Its packed int32 weight scale.
+        weights: Each consumer's ``[N_local, K]`` float8_e4m3fn weight, in consumer order.
+        weight_scales: Corresponding packed int32 weight scales.
         group_name: The TP group's c10d name (the registry key).
         tp_rank: This rank in the group.
         tp_size: Ranks in the group.
@@ -731,6 +759,8 @@ def ce_gather_gemm_impl(
         seq_len: ``S``.
         padded_seq_len: ``S_pad``.
     """
+    if not weights or len(weights) != len(weight_scales):
+        raise ValueError("shared gather needs a nonempty weight list and one scale per weight")
     try:
         state = get_state(group_name)
     except KeyError:
@@ -757,16 +787,19 @@ def ce_gather_gemm_impl(
             f"tp_size={tp_size}."
         )
     m = padded_rows // tp_size
-    _check_op_operands(x_fp8, x_sf, w_fp8, w_sf, m)
-    out = torch.empty((tp_size * m, w_fp8.shape[0]), dtype=torch.bfloat16, device=x_fp8.device)
+    for weight, scale in zip(weights, weight_scales):
+        _check_op_operands(x_fp8, x_sf, weight, scale, m)
+    outputs = [
+        torch.empty((tp_size * m, w.shape[0]), dtype=torch.bfloat16, device=x_fp8.device)
+        for w in weights
+    ]
     slot = state.next_slot()
     try:
         transport.issue(x_fp8, x_sf, slot)
-        a_fp8, a_sf = transport.chunk(tp_rank, slot)
-        fp8_block_gemm_out(a_fp8, a_sf, w_fp8, w_sf, out[tp_rank * m : (tp_rank + 1) * m])
-        for src in transport.consume_order:
+        for src in (tp_rank, *transport.consume_order):
             a_fp8, a_sf = transport.chunk(src, slot)
-            fp8_block_gemm_out(a_fp8, a_sf, w_fp8, w_sf, out[src * m : (src + 1) * m])
+            for weight, scale, out in zip(weights, weight_scales, outputs):
+                fp8_block_gemm_out(a_fp8, a_sf, weight, scale, out[src * m : (src + 1) * m])
         transport.done(slot)
     except CeResyncError as exc:
         # The resync after a failed boundary found the ranks disagreeing on their boundary count
@@ -778,5 +811,5 @@ def ce_gather_gemm_impl(
     except Exception:
         transport.reset()
         raise
-    out = drop_padding(out, batch_size, seq_len, padded_seq_len)
-    return out if out.is_contiguous() else out.contiguous()
+    outputs = [drop_padding(out, batch_size, seq_len, padded_seq_len) for out in outputs]
+    return [out if out.is_contiguous() else out.contiguous() for out in outputs]

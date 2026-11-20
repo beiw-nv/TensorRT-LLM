@@ -535,7 +535,6 @@ class GatedMLP(nn.Module):
                                   all_reduce_params=final_all_reduce_params,
                                   layer_idx=self.layer_idx)
 
-        fused_output_shape = None
         if self._can_fuse_gate_up_swiglu_fp4out():
             # During torch.compile the token dim is a SymInt, so `m >= MIN_M`
             # would create a SymBool guard that breaks piecewise CUDA graph
@@ -555,16 +554,25 @@ class GatedMLP(nn.Module):
         elif self._can_fuse_gate_up_swiglu_bf16(x):
             h2 = self._fused_gate_up_swiglu_bf16(x)
         else:
-            h1 = self.gate_up_proj(x)
-            if self._can_fuse_swiglu_fp8_quant():
-                if h1.dim() > 2:
-                    fused_output_shape = h1.shape[:-1]
-                    h1 = h1.reshape(-1, h1.shape[-1])
-                use_r128c4_layout = get_sm_version() == 107
-                h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
-                    h1, self.swiglu_limit, use_r128c4_layout)
-            else:
-                h2 = self._apply_activation(h1)
+            return self._down_from_gate_up(self.gate_up_proj(x),
+                                           final_all_reduce_params)
+
+        return self.down_proj(h2,
+                              all_reduce_params=final_all_reduce_params,
+                              layer_idx=self.layer_idx)
+
+    def _down_from_gate_up(self, h1, final_all_reduce_params=None):
+        """Apply the activation and down projection to an existing gate/up GEMM result."""
+        fused_output_shape = None
+        if self._can_fuse_swiglu_fp8_quant():
+            if h1.dim() > 2:
+                fused_output_shape = h1.shape[:-1]
+                h1 = h1.reshape(-1, h1.shape[-1])
+            use_r128c4_layout = get_sm_version() == 107
+            h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
+                h1, self.swiglu_limit, use_r128c4_layout)
+        else:
+            h2 = self._apply_activation(h1)
 
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,

@@ -43,6 +43,7 @@ from ...modules.linear import Linear, TensorParallelMode
 from ...modules.mlp import MLP
 from ..attention.attention import Attention, QKVMode
 from ..modules.rms_norm import RMSNormTPAware
+from .token_sharded_shared_input import SharedTokenShardedInput
 
 if TYPE_CHECKING:
     from .token_sharded_tp import TokenShardedTP
@@ -117,7 +118,12 @@ class TokenShardedColumn(TokenShardedAdapter):
         # Linear.forward(input, *, lora_params=None) applies its adapters to the dense input
         # when lora_params is truthy; the argument is keyword-only.
         lora_params = kwargs.get("lora_params")
-        if tp.uses_ce_gather(self, input, lora_params):
+        if isinstance(input, SharedTokenShardedInput):
+            if args:
+                raise TypeError("shared column inputs require keyword-only options")
+            value = input.for_consumer(self, tp, lora_params)
+            out = value if input.outputs else super().forward(value, *args, **kwargs)
+        elif tp.uses_ce_gather(self, input, lora_params):
             out = tp.ce_gather_gemm(self, input)
         else:
             gathered = tp.gather_input(self, input, prequantize=not lora_params)
@@ -157,6 +163,8 @@ class TokenShardedMLP(TokenShardedAdapter):
     gather mode an ``MLP`` whose ``up_proj`` takes an FP8 block-scale input runs the fused
     gather + GEMM for ``up_proj`` and then ``MLP.forward``'s own activation and
     ``down_proj``; a ``GatedMLP`` (fused gate-up paths) keeps the all-gather.
+    An explicit shared input supplies the gathered activation or up-projection result to
+    the same activation/down-projection tail without repeating the gather.
     """
 
     @classmethod
@@ -167,8 +175,7 @@ class TokenShardedMLP(TokenShardedAdapter):
         _check_linear(getattr(module, up, None), f"{name}.{up}", TensorParallelMode.COLUMN, tp)
         _check_linear(module.down_proj, f"{name}.down_proj", TensorParallelMode.ROW, tp)
         _stop_all_reduce(module.down_proj, f"{name}.down_proj")
-        if isinstance(module, MLP):
-            tp.note_consumer(module.up_proj)
+        tp.note_consumer(getattr(module, up))
 
     def forward(self, x, *args, **kwargs):
         tp = self._token_sharded_tp
@@ -177,7 +184,16 @@ class TokenShardedMLP(TokenShardedAdapter):
         # copy-engine gather) is skipped for exactly the calls the wrapped forward routes to
         # its LoRA path.
         lora_active = self._lora_active(args, kwargs)
-        if isinstance(self, MLP) and tp.uses_ce_gather(consumer, x, lora_active):
+        if isinstance(x, SharedTokenShardedInput):
+            value = x.for_consumer(self, tp, lora_active)
+            if not x.outputs:
+                partial = super().forward(value, *args, **kwargs)
+            elif isinstance(self, MLP):
+                partial = self._down_from_up(value)
+            else:
+                final_params = args[1] if len(args) >= 2 else kwargs.get("final_all_reduce_params")
+                partial = self._down_from_gate_up(value, final_params)
+        elif isinstance(self, MLP) and tp.uses_ce_gather(consumer, x, lora_active):
             partial = self._ce_forward(x)
         else:
             gathered = tp.gather_input(consumer, x, prequantize=not lora_active)
