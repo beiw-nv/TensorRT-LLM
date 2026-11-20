@@ -2325,7 +2325,7 @@ def _logic_adapters(rank, world_size, device):
         )
 
 
-def _shared_input_parts(rank, world_size, device, mode):
+def _shared_input_parts(rank, world_size, device, mode, *, tp=None):
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
     from tensorrt_llm._torch.modules.mlp import MLP
@@ -2362,7 +2362,8 @@ def _shared_input_parts(rank, world_size, device, mode):
         for cls in (MLP, GatedMLP)
     ]
     root = _as_model(qkv=columns[0], gate=columns[1], up=columns[2], mlp=mlps[0], gated=mlps[1])
-    tp = TokenShardedTP(dist.group.WORLD, gather_mode=mode)
+    if tp is None:
+        tp = TokenShardedTP(dist.group.WORLD, gather_mode=mode)
     convert_to_token_sharded_tp(
         root, tp, exceptions={"qkv": "column", "gate": "column", "up": "column"}
     )
@@ -2673,6 +2674,134 @@ def _logic_shared_input_chunked_graphs(rank, world_size, device):
     tp.close()
 
 
+def _logic_parallel_config_gather(rank, world_size, device):
+    """Serving YAML controls shared gathers and aligned, padded token plans."""
+    import tempfile
+    from pathlib import Path
+
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    for gather_mode in ("nccl", "copy_engine"):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serving.yaml"
+            path.write_text(
+                "model: /tmp/token-sharded-synthetic\nparallel_config:\n"
+                f"  tp_size: {world_size}\n  tp_layout: token_sharded\n"
+                f"  gather_mode: {gather_mode}\n  row_align: 64\n"
+            )
+            args = VisualGenArgs.from_yaml(path)
+        vgm = VisualGenMapping(world_size=world_size, rank=rank, tp_size=world_size)
+        config = DiffusionModelConfig(parallel=args.parallel_config, visual_gen_mapping=vgm)
+        tp = TokenShardedTP.from_model_config(config)
+        _, consumers, _ = _shared_input_parts(rank, world_size, device, gather_mode, tp=tp)
+        for rows in (64, 192):
+            plan = tp.begin(1, rows * world_size - 1)
+            _check(
+                plan.local_rows == rows and plan.is_padded and tp.row_align == 64,
+                "YAML row alignment did not reach the token plan",
+                device,
+            )
+            _check(tp.effective_gather_mode == gather_mode, "YAML gather backend", device)
+            loc = tp.local_view(
+                tp.shard(torch.randn(1, plan.seq_len, 640, device=device, dtype=torch.bfloat16))
+            )
+            reference = tuple(consumer(loc) for consumer in consumers)
+            moved = _spy_all_gather(tp)
+            if gather_mode == "copy_engine":
+                transport = tp._ce_state.transport
+                with patch.object(transport, "issue", wraps=transport.issue) as issued:
+                    shared = tp.share_input(loc, consumers)
+                _check(issued.call_count == 1, "YAML CE gather was not shared", device)
+            else:
+                shared = tp.share_input(loc, consumers)
+            actual = tuple(consumer(shared) for consumer in consumers)
+            del tp.all_gather
+            _check(len(moved) == (gather_mode == "nccl"), "YAML gather count", device)
+            _check(
+                all(torch.equal(a, b) for a, b in zip(actual, reference)),
+                "YAML-driven shared projections differ from independent projections",
+                device,
+            )
+        tp.close()
+
+
+def _logic_parallel_config_collectives(rank, world_size, device):
+    """Serving YAML controls real grouped gathers, alignment and production RS dispatch."""
+    import tempfile
+    from pathlib import Path
+
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    rs = _rs_module()
+    for gather_mode in ("nccl", "copy_engine"):
+        for reduce_mode in ("nccl", "copy_engine"):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "serving.yaml"
+                path.write_text(
+                    "model: /tmp/token-sharded-synthetic\nparallel_config:\n"
+                    f"  tp_size: {world_size}\n  tp_layout: token_sharded\n"
+                    f"  gather_mode: {gather_mode}\n  reduce_scatter_mode: {reduce_mode}\n"
+                    "  row_align: 64\n"
+                )
+                args = VisualGenArgs.from_yaml(path)
+            vgm = VisualGenMapping(world_size=world_size, rank=rank, tp_size=world_size)
+            config = DiffusionModelConfig(parallel=args.parallel_config, visual_gen_mapping=vgm)
+            tp = TokenShardedTP.from_model_config(config)
+            col, mlp = _shared_biased_mlp_parts(rank, world_size, device, tp)
+            for rows in (64, rs.CHUNK_ROWS + 64):
+                # Both shapes pad, remain 64-row aligned, and straddle production dispatch.
+                plan = tp.begin(1, rows * world_size - 1)
+                _check(
+                    plan.local_rows == rows and plan.is_padded and tp.row_align == 64,
+                    "YAML row alignment did not reach the token plan",
+                    device,
+                )
+                _check(
+                    tp.effective_gather_mode == gather_mode
+                    and tp.effective_reduce_scatter_mode == reduce_mode,
+                    "YAML modes did not reach real transports",
+                    device,
+                )
+                loc = tp.local_view(
+                    tp.shard(torch.randn(1, plan.seq_len, 256, device=device, dtype=torch.bfloat16))
+                )
+                reference = col(loc), mlp(loc)
+                moved = _spy_all_gather(tp)
+                scattered = _spy_reduce_scatter(tp)
+                if gather_mode == "copy_engine":
+                    transport = tp._ce_state.transport
+                    with patch.object(transport, "issue", wraps=transport.issue) as issued:
+                        shared = tp.share_input(loc, (col, mlp))
+                    _check(issued.call_count == 1, "YAML CE gather was not shared", device)
+                else:
+                    shared = tp.share_input(loc, (col, mlp))
+                if reduce_mode == "copy_engine":
+                    transport = tp._rs_state.transport
+                    with patch.object(transport, "begin", wraps=transport.begin) as rounds:
+                        actual = col(shared), mlp(shared)
+                    _check(
+                        rounds.call_count == (2 if rows > rs.CHUNK_ROWS else 0),
+                        "YAML CE reduction did not follow chunked production dispatch",
+                        device,
+                    )
+                else:
+                    actual = col(shared), mlp(shared)
+                del tp.all_gather, tp.reduce_scatter
+                _check(len(moved) == (gather_mode == "nccl"), "YAML gather backend", device)
+                expected_nccl = reduce_mode == "nccl" or rows < rs.CHUNK_ROWS
+                _check(len(scattered) == expected_nccl, "YAML RS backend/fallback", device)
+                _check(
+                    all(torch.equal(a, b) for a, b in zip(actual, reference)),
+                    "YAML-driven shared projections differ from independent projections",
+                    device,
+                )
+            tp.close()
+
+
 # =============================================================================
 # Test entry points
 # =============================================================================
@@ -2777,6 +2906,18 @@ def test_shared_input_dense_fallbacks_nccl(world_size):
 def test_shared_input_chunked_graphs_nccl(world_size):
     _requires_sm100f()
     _run(world_size, _checks(_logic_shared_input_chunked_graphs), "nccl")
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_parallel_config_gather_nccl(world_size):
+    _requires_sm100f()
+    _run(world_size, _checks(_logic_parallel_config_gather), "nccl")
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_parallel_config_collectives_nccl(world_size):
+    _requires_sm100f()
+    _run(world_size, _checks(_logic_parallel_config_collectives), "nccl")
 
 
 if __name__ == "__main__":

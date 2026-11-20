@@ -39,7 +39,7 @@ Its forward routes the residual stream through ``sharder.shard`` / ``gather``, p
 through ``shard(..., expected_seq_len=S)`` and per-sample tables through ``shard_per_sample``,
 while ``shard_rope`` leaves RoPE whole. Code between projections must be row-local.
 
-Gather modes (``gather_mode``, internal; :data:`DEFAULT_GATHER_MODE` is ``"nccl"``): ``"nccl"``
+Gather modes (``parallel_config.gather_mode``, default ``"nccl"``): ``"nccl"``
 all-gathers a column projection's input with NCCL and runs the GEMM on the gathered rows;
 ``"copy_engine"`` moves an FP8 block-scale input with copy engines through the TP group's
 symmetric-memory pool and runs the consumer's GEMM per source as each rank's rows arrive
@@ -48,8 +48,8 @@ copy-engine mode is probed once, rank-agreed, at the first :meth:`TokenShardedTP
 it is unavailable the helper keeps the NCCL gather and warns once. Its result is bitwise the
 NCCL path's (same quantized bytes, same DeepGEMM kernel per row block, bias added once).
 
-Reduce-scatter modes (``reduce_scatter_mode``, internal; :data:`DEFAULT_REDUCE_SCATTER_MODE` is
-``"nccl"``): ``"nccl"`` runs a row projection's GEMM on all tokens and reduce-scatters the
+Reduce-scatter modes (``parallel_config.reduce_scatter_mode``, default ``"nccl"``): ``"nccl"``
+runs a row projection's GEMM on all tokens and reduce-scatters the
 bf16 partial with NCCL; ``"copy_engine"`` fuses the two for an FP8 block-scale row Linear: the
 GEMM runs per destination rank, each destination's block is pushed with copy engines into its
 region of the TP group's symmetric-memory pool while the next block is multiplied, and the
@@ -629,26 +629,20 @@ class TokenShardedTP:
 
     @classmethod
     def from_model_config(cls, model_config: "DiffusionModelConfig") -> "TokenShardedTP":
-        """The helper for the TP group of ``model_config.visual_gen_mapping``.
-
-        The gather mode is ``model_config.parallel.token_sharded_gather`` when the parallel
-        config carries that attribute (and it is not None), else :data:`DEFAULT_GATHER_MODE`;
-        the reduce-scatter mode likewise reads ``token_sharded_reduce_scatter``, else
-        :data:`DEFAULT_REDUCE_SCATTER_MODE`.
-        """
+        """Build the TP helper using the modes and row alignment in ``parallel_config``."""
         vgm = model_config.visual_gen_mapping
         if vgm is None:
             raise ValueError(
                 "TokenShardedTP: tp_layout='token_sharded' needs a VisualGenMapping "
                 "(model_config.visual_gen_mapping is None)."
             )
-        gather_mode = getattr(model_config.parallel, "token_sharded_gather", None)
-        reduce_scatter_mode = getattr(model_config.parallel, "token_sharded_reduce_scatter", None)
+        parallel = model_config.parallel
         return cls(
             vgm.tp_group_pg,
             tp_rank=vgm.tp_rank,
-            gather_mode=gather_mode,
-            reduce_scatter_mode=reduce_scatter_mode,
+            row_align=parallel.row_align,
+            gather_mode=parallel.gather_mode,
+            reduce_scatter_mode=parallel.reduce_scatter_mode,
         )
 
     # --- plan -----------------------------------------------------------------------

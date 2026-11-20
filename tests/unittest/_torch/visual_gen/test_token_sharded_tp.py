@@ -698,25 +698,34 @@ def test_gather_mode_plumbing(monkeypatch):
     assert warnings == []
 
 
-def test_from_model_config_reads_optional_gather_attribute(monkeypatch):
-    """``parallel.token_sharded_gather`` selects the mode when the parallel config has it
-    (a future field); today's ParallelConfig has none and the module default applies."""
+@pytest.mark.parametrize("gather_mode", ["nccl", "copy_engine"])
+@pytest.mark.parametrize("reduce_scatter_mode", ["nccl", "copy_engine"])
+@pytest.mark.parametrize("row_align", [1, 128])
+def test_from_model_config_reads_parallel_controls(
+    gather_mode, reduce_scatter_mode, row_align, monkeypatch
+):
     monkeypatch.setattr(token_sharded_tp.dist, "get_world_size", lambda group: 2)
     monkeypatch.setattr(token_sharded_tp.dist, "get_rank", lambda group: 0)
     vgm = SimpleNamespace(tp_group_pg=_FAKE_GROUP, tp_rank=0)
-    parallel = ParallelConfig(tp_size=2, tp_layout="token_sharded")
-    assert not hasattr(parallel, "token_sharded_gather")  # no public knob yet
-    cfg = SimpleNamespace(visual_gen_mapping=vgm, parallel=parallel)
-    assert TokenShardedTP.from_model_config(cfg).gather_mode == "nccl"
-    cfg.parallel = SimpleNamespace(token_sharded_gather="copy_engine")
-    assert TokenShardedTP.from_model_config(cfg).gather_mode == "copy_engine"
-    cfg.parallel = SimpleNamespace(token_sharded_gather=None)
-    assert TokenShardedTP.from_model_config(cfg).gather_mode == "nccl"
-    monkeypatch.setattr(token_sharded_tp, "DEFAULT_GATHER_MODE", "copy_engine")
-    assert TokenShardedTP.from_model_config(cfg).gather_mode == "copy_engine"
-    cfg.parallel = SimpleNamespace(token_sharded_gather="bogus")
-    with pytest.raises(ValueError, match="gather_mode must be one of"):
-        TokenShardedTP.from_model_config(cfg)
+    parallel = ParallelConfig(
+        tp_size=2,
+        tp_layout="token_sharded",
+        gather_mode=gather_mode,
+        reduce_scatter_mode=reduce_scatter_mode,
+        row_align=row_align,
+    )
+    cfg = DiffusionModelConfig(parallel=parallel)
+    cfg.visual_gen_mapping = vgm
+    tp = TokenShardedTP.from_model_config(cfg)
+    assert tp.gather_mode == gather_mode
+    assert tp.reduce_scatter_mode == reduce_scatter_mode
+    assert tp.row_align == row_align
+    # Exercise begin()'s plan creation while keeping the collective/probes out of this CPU test.
+    monkeypatch.setattr(tp, "_check_rank_agreement", lambda b, s: None)
+    monkeypatch.setattr(tp, "_ce_begin", lambda p: None)
+    monkeypatch.setattr(tp, "_rs_begin", lambda p: None)
+    plan = tp.begin(1, 5)
+    assert plan.row_align == row_align and plan.local_rows % row_align == 0
 
 
 def test_uses_ce_gather_rule(monkeypatch):
@@ -976,32 +985,6 @@ def test_reduce_scatter_mode_plumbing(monkeypatch):
     tp.close()
     assert tp._rs_consumers == [] and tp._rs_state is None and mod.registry == {}
     assert warnings == []
-
-
-def test_from_model_config_reads_optional_rs_attribute(monkeypatch):
-    """``parallel.token_sharded_reduce_scatter`` selects the mode when the parallel config has
-    it (a future field); today's ParallelConfig has none and the module default applies."""
-    monkeypatch.setattr(token_sharded_tp.dist, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(token_sharded_tp.dist, "get_rank", lambda group: 0)
-    vgm = SimpleNamespace(tp_group_pg=_FAKE_GROUP, tp_rank=0)
-    parallel = ParallelConfig(tp_size=2, tp_layout="token_sharded")
-    assert not hasattr(parallel, "token_sharded_reduce_scatter")  # no public knob
-    cfg = SimpleNamespace(visual_gen_mapping=vgm, parallel=parallel)
-    tp = TokenShardedTP.from_model_config(cfg)
-    assert tp.reduce_scatter_mode == "nccl" and tp.gather_mode == "nccl"
-    cfg.parallel = SimpleNamespace(token_sharded_reduce_scatter="copy_engine")
-    tp = TokenShardedTP.from_model_config(cfg)
-    assert tp.reduce_scatter_mode == "copy_engine" and tp.gather_mode == "nccl"
-    cfg.parallel = SimpleNamespace(
-        token_sharded_gather="copy_engine", token_sharded_reduce_scatter=None
-    )
-    tp = TokenShardedTP.from_model_config(cfg)
-    assert tp.reduce_scatter_mode == "nccl" and tp.gather_mode == "copy_engine"
-    monkeypatch.setattr(token_sharded_tp, "DEFAULT_REDUCE_SCATTER_MODE", "copy_engine")
-    assert TokenShardedTP.from_model_config(cfg).reduce_scatter_mode == "copy_engine"
-    cfg.parallel = SimpleNamespace(token_sharded_reduce_scatter="bogus")
-    with pytest.raises(ValueError, match="reduce_scatter_mode must be one of"):
-        TokenShardedTP.from_model_config(cfg)
 
 
 def test_uses_ce_reduce_scatter_rule(monkeypatch):
@@ -1568,3 +1551,17 @@ def test_shared_input_mlp_preserves_reduce_scatter_routing(gather_mode, fused_re
     assert len(calls["quantize"]) == 1
     assert len(calls["gather"]) == (gather_mode == "nccl")
     assert len(calls["multi"]) == (gather_mode == "copy_engine")
+
+
+def test_model_config_defaults_keep_nccl_and_unaligned_rows(monkeypatch):
+    monkeypatch.setattr(token_sharded_tp.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(token_sharded_tp.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(token_sharded_tp, "DEFAULT_GATHER_MODE", "copy_engine")
+    monkeypatch.setattr(token_sharded_tp, "DEFAULT_REDUCE_SCATTER_MODE", "copy_engine")
+    cfg = SimpleNamespace(
+        visual_gen_mapping=SimpleNamespace(tp_group_pg=_FAKE_GROUP, tp_rank=0),
+        parallel=ParallelConfig(tp_size=2, tp_layout="token_sharded"),
+    )
+    tp = TokenShardedTP.from_model_config(cfg)
+    assert tp.gather_mode == tp.reduce_scatter_mode == "nccl"
+    assert tp.row_align == 1
