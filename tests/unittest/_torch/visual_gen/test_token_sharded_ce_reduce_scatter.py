@@ -380,8 +380,9 @@ def test_low_m_gemm_rows_keep_the_module_gemm(monkeypatch):
     its prologue forms); the fused op's per-block GEMM is DeepGEMM, so those calls keep the
     module's GEMM and the NCCL reduce-scatter. The default range (max_m 0: an unserved shape or
     device) and a Linear without the attribute never block."""
+    monkeypatch.setattr(token_sharded_tp, "MIN_CE_REDUCE_SCATTER_ROWS", 0)
     ts = _ce_rs_helper(monkeypatch)
-    lin = _fp8_block_linear()
+    lin = _fp8_block_linear(bias=True)
     assert lin.fp8_low_m_gemm == Fp8BlockScaleLowMGemmRange()  # create_weights: max_m 0
 
     def rows(m, dtype=torch.bfloat16):
@@ -419,6 +420,7 @@ def test_row_adapter_decides_on_its_padded_input(monkeypatch):
     takes the fused op (the module's GEMM would be DeepGEMM on ``B * S_pad`` rows), and a
     viewable non-contiguous input the range serves once padded keeps the module's GEMM."""
     monkeypatch.setattr(token_sharded_tp, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(token_sharded_tp, "MIN_CE_REDUCE_SCATTER_ROWS", 0)
     plan = TokenShardPlan.build(1, 5, 2, 0)  # 5 real rows, S_pad 6
     assert plan.is_padded and plan.num_tokens == 5 and plan.padded_rows == 6
     ts = simulated_helper(plan, reduce_scatter_mode="copy_engine")
@@ -442,7 +444,7 @@ def test_row_adapter_decides_on_its_padded_input(monkeypatch):
             calls.append(("gemm", x)) or torch.zeros(x.shape[0], 128, dtype=torch.bfloat16)
         ),
     )
-    lin = _fp8_block_linear()  # [128, 256]: K_local 256 at tp 2
+    lin = _fp8_block_linear(bias=True)  # [128, 256]: K_local 256 at tp 2
     lin.tp_size, lin.tp_mode = 2, TensorParallelMode.ROW
     token_sharded_modules._convert(lin, "row", ts, "blocks.0.attn1.to_out.0")
     x = torch.randn(1, 5, 256, dtype=torch.bfloat16)
@@ -534,6 +536,120 @@ def test_rs_op_without_a_registered_state_raises():
     x, sf, w, ws, bias = _op_inputs(8, 256, 128, True)
     with pytest.raises(RuntimeError, match="no CeReduceScatterState is registered for TP group"):
         _OP(x, sf, w, ws, bias, "no-such-group", 0, 2, 1, 8, 8)
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("m", [1, 2, 5])
+def test_rs_op_chunks_destination_rows(tp, m, monkeypatch):
+    """Run the op body with a CPU transport: tails, row offsets, staging reuse and bias.
+
+    Synthetic partials encode both source and destination row. The transport checks each
+    outgoing block and supplies the remote sources' bytes without a process group.
+    """
+    chunk_rows, n, k = 2, 8, 128
+    monkeypatch.setattr(tsr, "CHUNK_ROWS", chunk_rows)
+    monkeypatch.setattr(tsr, "mn_major_scales", lambda sf: sf)
+    all_rows = torch.arange(tp * m).to(torch.float8_e4m3fn).view(-1, 1).expand(-1, k).contiguous()
+    row_values = all_rows[:, 0].float().to(torch.bfloat16)
+    bias = torch.full((n,), 0.25, dtype=torch.bfloat16)
+
+    for rank in range(tp):
+
+        class Transport:
+            tp_size = tp
+
+            def __init__(self):
+                self.rank = rank
+                self.dest_order = [(rank - i) % tp for i in range(1, tp)]
+                self.start = 0
+                self.active = False
+                self.capacity = 0
+                self.pointers = set()
+
+            def covers(self, layout):
+                return self.capacity >= layout.slot_nbytes(tp)
+
+            def reserve(self, layout):
+                assert layout.rows <= chunk_rows
+                self.capacity = layout.slot_nbytes(tp)
+
+            def begin(self, slot, layout):
+                assert not self.active and self.covers(layout)
+                self.active = True
+                self.count = layout.rows
+                rows = row_values[rank * m + self.start : rank * m + self.start + self.count]
+                self.parts = torch.stack(
+                    [(rows[:, None].expand(-1, n) + src).to(torch.bfloat16) for src in range(tp)]
+                )
+                self.pushed = []
+
+            def push(self, dst, slot, block):
+                rows = row_values[dst * m + self.start : dst * m + self.start + self.count]
+                assert torch.equal(block, (rows[:, None].expand(-1, n) + rank).to(torch.bfloat16))
+                self.pointers.add(block.untyped_storage().data_ptr())
+                self.pushed.append(dst)
+
+            def own_view(self, slot):
+                return self.parts[rank]
+
+            def wait_all(self, slot):
+                assert self.pushed == self.dest_order
+
+            def partials(self, slot):
+                return self.parts
+
+            def done(self, slot):
+                self.active = False
+                self.start += self.count
+
+            def reset(self):
+                pytest.fail("the chunked op unexpectedly reset the transport")
+
+        transport = Transport()
+        state = SimpleNamespace(transport=transport, next_slot=lambda: 0)
+        monkeypatch.setattr(tsr, "get_rs_state", lambda name: state)
+
+        def gemm(x, sf, w, ws, out):
+            # Verify scales were sliced with the same destination/chunk offsets as activations.
+            assert torch.equal(x[:, 0].float(), sf[:, 0].float())
+            out.copy_((x[:, :1].float() + rank).expand_as(out))
+
+        monkeypatch.setattr(tsr, "fp8_block_gemm_out", gemm)
+        _, sf, w, ws, _ = _op_inputs(tp * m, k, n, False)
+        sf[:, 0] = row_values.to(torch.int32)
+        out = tsr.ce_gemm_reduce_scatter_impl(
+            all_rows, sf, w, ws, bias, "cpu", rank, tp, 1, tp * m, tp * m
+        )
+        local = row_values[rank * m : (rank + 1) * m, None].expand(-1, n)
+        expected = reference_fixed_order_reduce(
+            [(local + src).to(torch.bfloat16) for src in range(tp)], bias
+        )
+        assert torch.equal(out, expected)
+        assert transport.start == m and not transport.active
+        assert len(transport.pointers) == 1  # one bounded staging allocation, reused each round
+        assert transport.capacity == Bf16RowsRegionLayout(min(m, chunk_rows), n).slot_nbytes(tp)
+
+
+def test_rs_prepare_caps_workspace_at_large_token_counts(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    reserved = []
+
+    def covers(layout):
+        return bool(reserved) and reserved[-1].region_nbytes >= layout.region_nbytes
+
+    state = SimpleNamespace(
+        probe_once=lambda **kwargs: True,
+        group_name="cpu-cap-test",
+        world_size=4,
+        consumer_ns={5120},
+        begin_forward=lambda: None,
+        transport=SimpleNamespace(covers=covers, reserve=reserved.append),
+    )
+    for tokens in (768, 32768, 65536, 768):
+        plan = TokenShardPlan.build(1, tokens, 4, 0)
+        CeReduceScatterState.prepare(state, plan)
+    assert [layout.rows for layout in reserved] == [192, tsr.CHUNK_ROWS]
+    assert reserved[-1].slot_nbytes(4) == 320 * 1024**2
 
 
 # =============================================================================

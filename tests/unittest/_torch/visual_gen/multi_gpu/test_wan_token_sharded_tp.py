@@ -32,6 +32,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import functools
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -887,6 +888,7 @@ def _compiled_graph_stats(fn):
     return out, counters["stats"]["unique_graphs"], {str(k) for k in counters["graph_break"]}
 
 
+@patch("tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp.MIN_CE_REDUCE_SCATTER_ROWS", 0)
 def _logic_fp8_block_scales_block(
     rank,
     world_size,
