@@ -95,6 +95,9 @@ if TYPE_CHECKING:
     from .token_sharded_ce_gather import CeGatherState
     from .token_sharded_ce_reduce_scatter import CeReduceScatterState
 
+
+    from .token_sharded_shared_input import SharedTokenShardedInput
+
 __all__ = [
     "DEFAULT_GATHER_MODE",
     "DEFAULT_REDUCE_SCATTER_MODE",
@@ -767,6 +770,24 @@ class TokenShardedTP:
         """
         p = self.plan
         return t.view(len(p.entry_batch), p.rows_per_entry, *t.shape[1:])
+
+    def share_input(
+        self,
+        act: torch.Tensor | Fp8BlockScaledActivation,
+        consumers: tuple[nn.Module, ...],
+        *,
+        prequantize: bool = True,
+    ) -> "SharedTokenShardedInput":
+        """Gather identical rows once for sibling column/MLP adapter calls.
+
+        ``act`` is this rank's BF16 ``[m, K]`` / ``[n, g, K]`` rows or a packed FP8 pair.
+        Pass the returned value to each listed, already converted adapter in place of ``act``.
+        Use ``prequantize=False`` if any consumer has active LoRA. See
+        :func:`token_sharded_shared_input.share_input` for eligibility and LoRA handling.
+        """
+        from .token_sharded_shared_input import share_input
+
+        return share_input(self, act, consumers, prequantize=prequantize)
 
     def gather_input(
         self, consumer: nn.Module | None, act: Activation, *, prequantize: bool = True

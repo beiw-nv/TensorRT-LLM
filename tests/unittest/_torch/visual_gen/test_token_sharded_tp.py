@@ -1354,3 +1354,156 @@ def test_ce_reduce_scatter_probe_falls_back_on_gloo(monkeypatch):
         other.close()
         mod = token_sharded_tp._ce_rs_module()
         assert token_sharded_tp._registered_rs_state(mod, group.group_name) is None
+
+
+def _shared_adapters(monkeypatch, mode="nccl", *, mixed=False):
+    from tensorrt_llm._torch.visual_gen.parallel import token_sharded_shared_input as shared_mod
+
+    monkeypatch.setattr(token_sharded_tp, "is_sm_100f", lambda: True)
+    ts = simulated_helper(TokenShardPlan.build(1, 8, 2, 0), gather_mode=mode)
+    ts._ce_state = SimpleNamespace(
+        effective=mode == "copy_engine", reason="", note_consumer=lambda k: None
+    )
+    calls = {"gather": [], "quantize": [], "multi": [], "linear": []}
+    quant = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    col = _as_tp(
+        Linear(
+            128,
+            128,
+            bias=True,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig() if mixed else quant,
+        ),
+        TensorParallelMode.COLUMN,
+    )
+    mlp = MLP(
+        hidden_size=128,
+        intermediate_size=256,
+        bias=True,
+        activation=torch.nn.functional.gelu,
+        dtype=torch.bfloat16,
+        config=ModelConfig(quant_config=quant),
+    )
+    gated = GatedMLP(
+        hidden_size=128,
+        intermediate_size=256,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=ModelConfig(quant_config=quant),
+    )
+    gated._can_fuse_swiglu_fp8_quant = lambda: False
+    gated._apply_activation = (
+        lambda h: torch.nn.functional.silu(h.chunk(2, -1)[0]) * h.chunk(2, -1)[1]
+    )
+    for module in (mlp, gated):
+        up = module.up_proj if isinstance(module, MLP) else module.gate_up_proj
+        _as_tp(up, TensorParallelMode.COLUMN)
+        _as_tp(module.down_proj, TensorParallelMode.ROW)
+    for name, module, kind in (
+        ("qkv", col, "column"),
+        ("mlp", mlp, "mlp"),
+        ("gated", gated, "mlp"),
+    ):
+        token_sharded_modules._convert(module, kind, ts, name)
+    for module in (col, mlp, gated):
+        for linear in module.modules():
+            if isinstance(linear, Linear):
+                linear.weight.data.copy_(
+                    torch.full(linear.weight.shape, 0.0625).to(linear.weight.dtype)
+                )
+                if linear.bias is not None:
+                    linear.bias.data.fill_(0.25)
+
+    def quantize(x):
+        calls["quantize"].append(x)
+        x = x.reshape(-1, 128)
+        return Fp8BlockScaledActivation(
+            x.to(torch.float8_e4m3fn),
+            torch.zeros(x.shape[0], fp8_scale_cols(128), dtype=torch.int32),
+        )
+
+    def gather(value):
+        calls["gather"].append(value)
+        if isinstance(value, Fp8BlockScaledActivation):
+            return Fp8BlockScaledActivation(
+                torch.cat([value.fp8, value.fp8]), torch.cat([value.scale, value.scale])
+            )
+        return torch.cat([value, value])
+
+    def linear_forward(module, x, *args, **kwargs):
+        calls["linear"].append((module, x, args, kwargs))
+        x = x.fp8 if isinstance(x, Fp8BlockScaledActivation) else x
+        result = x.to(torch.bfloat16) @ module.weight.to(torch.bfloat16).t()
+        return result + module.bias if module.bias is not None else result
+
+    def multi(x, sf, weights, scales, *plan):
+        calls["multi"].append((weights, scales, plan))
+        full = torch.cat([x, x]).to(torch.bfloat16)
+        return [full @ weight.to(torch.bfloat16).t() for weight in weights]
+
+    monkeypatch.setattr(shared_mod, "quantize_fp8_block", quantize)
+    monkeypatch.setattr(token_sharded_tp, "quantize_fp8_block", quantize)
+    monkeypatch.setattr(Linear, "forward", linear_forward)
+    monkeypatch.setattr(torch.ops.trtllm, "token_sharded_fp8_ce_gather_gemms", multi)
+    ts.all_gather = gather
+    ts.reduce_scatter = lambda x: x[: ts.plan.local_rows]
+    return ts, (col, mlp, gated), calls
+
+
+@pytest.mark.parametrize("mode", ["nccl", "copy_engine"])
+def test_shared_input_column_mlp_and_gated_mlp(mode, monkeypatch):
+    ts, modules, calls = _shared_adapters(monkeypatch, mode)
+    x = torch.ones(4, 128, dtype=torch.bfloat16)
+    shared = ts.share_input(x, modules)
+    outputs = tuple(module(shared) for module in modules)
+    assert [tuple(out.shape) for out in outputs] == [(1, 8, 128), (1, 4, 128), (1, 4, 128)]
+    assert len(calls["quantize"]) == 1
+    assert len(calls["gather"]) == (mode == "nccl")
+    assert len(calls["multi"]) == (mode == "copy_engine")
+    if mode == "nccl":
+        up_projections = (modules[0], modules[1].up_proj, modules[2].gate_up_proj)
+        seen = [x for module, x, _, _ in calls["linear"] if module in up_projections]
+        assert len(seen) == 3 and all(value is shared.activation for value in seen)
+    else:
+        assert len(calls["multi"][0][0]) == 3
+    # A fresh invocation must recompute even if the same tensor is modified in place.
+    x.add_(1)
+    again = ts.share_input(x, modules)
+    assert not torch.equal(modules[0](again), outputs[0])
+    assert len(calls["quantize"]) == 2
+
+
+def test_shared_input_mixed_quantizers_and_lora_keep_dense_rows(monkeypatch):
+    ts, modules, calls = _shared_adapters(monkeypatch, "copy_engine", mixed=True)
+    x = torch.ones(4, 128, dtype=torch.bfloat16)
+    shared = ts.share_input(x, modules)
+    tuple(module(shared) for module in modules)
+    assert len(calls["gather"]) == 1
+    assert isinstance(shared.activation, torch.Tensor)
+    assert calls["quantize"] == calls["multi"] == []
+    dense = ts.share_input(x, modules, prequantize=False)
+    modules[0](dense, lora_params={"active": True})
+    assert calls["linear"][-1][3]["lora_params"] == {"active": True}
+
+
+def test_shared_input_rejects_wrong_consumers_plans_and_lora(monkeypatch):
+    ts, modules, _ = _shared_adapters(monkeypatch, "copy_engine")
+    x = torch.ones(4, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="at least one"):
+        ts.share_input(x, ())
+    with pytest.raises(ValueError, match="distinct"):
+        ts.share_input(x, (modules[0], modules[0]))
+    with pytest.raises(ValueError, match="converted"):
+        ts.share_input(x, (torch.nn.Identity(),))
+    with pytest.raises(ValueError, match="width"):
+        ts.share_input(x[:, :64], modules)
+    shared = ts.share_input(x, modules[:1])
+    with pytest.raises(ValueError, match="not a consumer"):
+        modules[1](shared)
+    with pytest.raises(ValueError, match="LoRA"):
+        modules[0](shared, lora_params={"active": True})
+    with pytest.raises(TypeError, match="keyword-only"):
+        modules[0](shared, None)
+    ts._plan = TokenShardPlan.build(1, 6, 2, 0)
+    with pytest.raises(ValueError, match="token plan"):
+        modules[0](shared)

@@ -2391,6 +2391,58 @@ def _(
                                 dtype=output_dtype)
 
 
+@torch.library.custom_op("trtllm::token_sharded_fp8_ce_gather_gemms",
+                         mutates_args=())
+def token_sharded_fp8_ce_gather_gemms(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: List[torch.Tensor],
+    weight_scales: List[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> List[torch.Tensor]:
+    """Gather FP8 rows and packed UE8M0 scales once for several column GEMMs.
+
+    Each source chunk feeds every weight before its pool slot is released.
+    Returns one bf16 [batch_size * seq_len, N_local] tensor per weight;
+    biases are applied by the caller. The rank-symmetric call ordering and
+    hidden transport effects are those of token_sharded_fp8_ce_gather_gemm.
+    """
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_ce_gather import \
+        ce_gather_gemms_impl
+    return ce_gather_gemms_impl(x_fp8, x_sf, weights, weight_scales, group_name,
+                                tp_rank, tp_size, batch_size, seq_len,
+                                padded_seq_len)
+
+
+@token_sharded_fp8_ce_gather_gemms.register_fake
+def _(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: List[torch.Tensor],
+    weight_scales: List[torch.Tensor],
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
+    batch_size: int,
+    seq_len: int,
+    padded_seq_len: int,
+) -> List[torch.Tensor]:
+    del x_sf, group_name, tp_rank, tp_size, padded_seq_len
+    if not weights or len(weights) != len(weight_scales):
+        raise ValueError(
+            "shared gather needs a nonempty weight list and one scale per weight"
+        )
+    return [
+        x_fp8.new_empty((batch_size * seq_len, w.shape[0]),
+                        dtype=torch.bfloat16) for w in weights
+    ]
+
+
 @torch.library.custom_op("trtllm::token_sharded_fp8_ce_gather_gemm",
                          mutates_args=())
 def token_sharded_fp8_ce_gather_gemm(

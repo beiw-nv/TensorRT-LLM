@@ -2289,6 +2289,243 @@ def _logic_adapters(rank, world_size, device):
         )
 
 
+def _shared_input_parts(rank, world_size, device, mode):
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._torch.modules.mlp import MLP
+
+    torch.manual_seed(41)
+    k, n = 640, 128 * world_size
+    config = ModelConfig(
+        mapping=_mapping(rank, world_size),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        allreduce_strategy=AllReduceStrategy.NCCL,
+    )
+    columns = [
+        Linear(
+            k,
+            n,
+            bias=True,
+            dtype=torch.bfloat16,
+            mapping=config.mapping,
+            quant_config=config.quant_config,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            reduce_output=False,
+        ).to(device)
+        for _ in range(3)
+    ]
+    mlps = [
+        cls(
+            hidden_size=k,
+            intermediate_size=n,
+            bias=False,
+            dtype=torch.bfloat16,
+            activation=gelu_tanh if cls is MLP else F.silu,
+            config=config,
+        ).to(device)
+        for cls in (MLP, GatedMLP)
+    ]
+    root = _as_model(qkv=columns[0], gate=columns[1], up=columns[2], mlp=mlps[0], gated=mlps[1])
+    tp = TokenShardedTP(dist.group.WORLD, gather_mode=mode)
+    convert_to_token_sharded_tp(
+        root, tp, exceptions={"qkv": "column", "gate": "column", "up": "column"}
+    )
+    for col in columns:
+        w = torch.randn(n, k, dtype=torch.bfloat16) * 0.03
+        col.load_weights([{**fp8_block_checkpoint(w), "bias": torch.randn(n) * 0.01}])
+        col.post_load_weights()
+    for mlp in mlps:
+        w_up = torch.randn(n, k, dtype=torch.bfloat16) * 0.03
+        up = mlp.up_proj if isinstance(mlp, MLP) else mlp.gate_up_proj
+        checkpoint = [fp8_block_checkpoint(w_up)]
+        if isinstance(mlp, GatedMLP):
+            checkpoint.append(fp8_block_checkpoint(torch.randn(n, k, dtype=torch.bfloat16) * 0.03))
+        up.load_weights(checkpoint)
+        mlp.down_proj.load_weights(
+            [fp8_block_checkpoint(torch.randn(k, n, dtype=torch.bfloat16) * 0.03)]
+        )
+        up.post_load_weights()
+        mlp.down_proj.post_load_weights()
+    return tp, tuple(columns + mlps), root
+
+
+def _logic_shared_input_adapters(rank, world_size, device):
+    import torch._dynamo
+
+    for mode in ("nccl", "copy_engine"):
+        tp, consumers, root = _shared_input_parts(rank, world_size, device, mode)
+        keys = tuple(root.state_dict())
+
+        def grouped(x):
+            shared = tp.share_input(x, consumers)
+            return tuple(consumer(shared) for consumer in consumers)
+
+        def independent(x):
+            return tuple(consumer(x) for consumer in consumers)
+
+        for b, s in _FP8_SHAPES:
+            tp.begin(b, s)
+            x = torch.randn(b, s, 640, device=device, dtype=torch.bfloat16)
+            loc = tp.local_view(tp.shard(x))
+            reference = independent(loc)
+            moved = _spy_all_gather(tp)
+            issued = []
+            transport = tp._ce_state.transport if mode == "copy_engine" else None
+            if transport is not None:
+                issue = transport.issue
+
+                def counted(*a, **kw):
+                    issued.append(1)
+                    return issue(*a, **kw)
+
+                transport.issue = counted
+            got = grouped(loc)
+            if transport is not None:
+                del transport.issue
+            del tp.all_gather
+            _check(
+                all(torch.equal(g, r) for g, r in zip(got, reference)),
+                f"shared {mode} != independent {(b, s)}",
+                device,
+            )
+            _check(
+                len(moved) == (mode == "nccl") and len(issued) == (mode == "copy_engine"),
+                f"shared {mode} gather count: NCCL {len(moved)}, CE {len(issued)}",
+                device,
+            )
+            packed = quantize_fp8_block(loc)
+            got_packed = grouped(packed)
+            _check(
+                all(torch.equal(g, r) for g, r in zip(got_packed, reference)),
+                f"shared prequantized {mode} {(b, s)}",
+                device,
+            )
+        _check(tuple(root.state_dict()) == keys, "sharing changed state_dict keys", device)
+        if world_size in (2, 4):
+            tp.begin(2, 5)
+            loc = tp.local_view(
+                tp.shard(torch.randn(2, 5, 640, device=device, dtype=torch.bfloat16))
+            )
+            compiled = torch.compile(grouped, fullgraph=True)
+            compiled_ref = torch.compile(independent, fullgraph=True)
+            actual, reference = compiled(loc), compiled_ref(loc)
+            _check(
+                all(torch.equal(g, r) for g, r in zip(actual, reference)),
+                f"shared compiled {mode}",
+                device,
+            )
+            # Both slots must be warm before capture.
+            grouped(loc)
+            reference = grouped(loc)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = grouped(loc)
+            graph.replay()
+            _check(
+                all(torch.equal(g, r) for g, r in zip(captured, reference)),
+                f"shared CUDA graph {mode}",
+                device,
+            )
+            loc.add_(0.125)
+            reference = grouped(loc)
+            graph.replay()
+            _check(
+                all(torch.equal(g, r) for g, r in zip(captured, reference)),
+                f"shared CUDA graph fresh rows {mode}",
+                device,
+            )
+            del graph
+        tp.close()
+
+
+def _logic_shared_input_dense_fallbacks(rank, world_size, device):
+    """Real BF16/FP8 consumers and an active native LoRA share one dense gather."""
+    from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import _convert
+
+    torch.manual_seed(91)
+    k, n = 256, 128 * world_size
+    mapping = _mapping(rank, world_size)
+    for mode in ("nccl", "copy_engine"):
+        tp = TokenShardedTP(dist.group.WORLD, gather_mode=mode)
+        columns = [
+            Linear(
+                k,
+                n,
+                bias=True,
+                dtype=torch.bfloat16,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                reduce_output=False,
+                quant_config=QuantConfig(quant_algo=algo) if algo else QuantConfig(),
+            ).to(device)
+            for algo in (QuantAlgo.FP8_BLOCK_SCALES, None, QuantAlgo.FP8_BLOCK_SCALES)
+        ]
+        for name, col in zip(("fp8", "dense", "fp8_sibling"), columns):
+            _convert(col, "column", tp, name)
+        for index, col in enumerate(columns):
+            weight = torch.randn(n, k, dtype=torch.bfloat16) * 0.03
+            checkpoint = fp8_block_checkpoint(weight) if index != 1 else {"weight": weight}
+            checkpoint["bias"] = torch.randn(n, dtype=torch.bfloat16) * 0.01
+            col.load_weights([checkpoint])
+            col.post_load_weights()
+        plan = tp.begin(1, 127)
+        loc = tp.local_view(tp.shard(torch.randn(1, 127, k, device=device, dtype=torch.bfloat16)))
+        for with_lora in (False, True):
+            consumers = (columns[0], columns[2]) if with_lora else tuple(columns)
+            options = {}
+            if with_lora:
+                col = columns[0]
+                col.lora = LoraLayer([LoraModuleType.ATTENTION_Q], [128])
+                lora_a = torch.randn(16, k, device=device, dtype=torch.bfloat16) * 0.1
+                lora_b = torch.randn(128, 16, device=device, dtype=torch.bfloat16) * 0.1
+                params = {
+                    "num_seqs": 1,
+                    "host_request_types": torch.zeros(1, dtype=torch.int32),
+                    "prompt_lens_cpu": torch.tensor([plan.seq_len], dtype=torch.int32),
+                    0: {
+                        int(LoraModuleType.ATTENTION_Q): {
+                            "adapter_size": torch.tensor([16], dtype=torch.int32),
+                            "weight_pointers": torch.tensor(
+                                [[lora_a.data_ptr(), lora_b.data_ptr(), 0]], dtype=torch.int64
+                            ),
+                        }
+                    },
+                }
+                options = {"lora_params": params, "layer_idx": 0}
+            # Dense fallback must match independently gathered dense inputs. FP8 activation
+            # quantization belongs to each consumer and may select its own quantizer.
+            dense_rows = tp.all_gather(loc.reshape(-1, k))
+            reference = tuple(
+                Linear.forward(col, dense_rows, **(options if index == 0 else {})).view(
+                    1, plan.seq_len, -1
+                )
+                for index, col in enumerate(consumers)
+            )
+            moved = _spy_all_gather(tp)
+            shared = tp.share_input(loc, consumers, prequantize=not with_lora)
+            actual = tuple(
+                col(shared, **(options if index == 0 else {}))
+                for index, col in enumerate(consumers)
+            )
+            del tp.all_gather
+            _check(len(moved) == 1, "dense fallback did not share one gather", device)
+            _check(isinstance(shared.activation, torch.Tensor), "fallback was not dense", device)
+            _check(
+                all(torch.equal(a, b) for a, b in zip(actual, reference)),
+                f"mixed quantizers / active LoRA mismatch ({mode}, {with_lora})",
+                device,
+            )
+            if with_lora:
+                base = Linear.forward(columns[0], dense_rows).view(1, plan.seq_len, -1)
+                _check(not torch.equal(actual[0], base), "LoRA was not active", device)
+                delta = columns[0].lora(dense_rows, params, 0)
+                expected_delta = (dense_rows @ lora_a.t()) @ lora_b.t()
+                _check_close(delta, expected_delta, device, 2e-2, 2e-2, "native LoRA delta")
+        tp.close()
+
+
 # =============================================================================
 # Test entry points
 # =============================================================================
@@ -2312,7 +2549,12 @@ _GRAPH_CHECKS = (_logic_compile_fullgraph, _logic_cuda_graph)
 _FP8_KERNEL_CHECKS = (_logic_fp8_quant_tactics, _logic_adapters_fp8_block_scales)
 _FP8_GRAPH_CHECKS = (_logic_compile_fullgraph_fp8, _logic_cuda_graph_fp8)
 # The copy-engine gather: per-chunk GEMM, transport, adapters in both modes, and the graphs.
-_CE_CHECKS = (_logic_fp8_block_gemm_out, _logic_ce_transport, _logic_adapters_ce_gather)
+_CE_CHECKS = (
+    _logic_fp8_block_gemm_out,
+    _logic_ce_transport,
+    _logic_adapters_ce_gather,
+    _logic_shared_input_adapters,
+)
 _CE_GRAPH_CHECKS = (_logic_compile_fullgraph_ce, _logic_cuda_graph_ce)
 # The copy-engine reduce-scatter: the fused GEMM + RS op, adapters in both modes, the graphs.
 _RS_CHECKS = (_logic_ce_reduce_scatter_op, _logic_adapters_ce_reduce_scatter)
@@ -2376,6 +2618,12 @@ def test_fp8_ce_reduce_scatter_nccl(world_size):
     _requires_sm100f()
     checks = _RS_CHECKS + (_RS_GRAPH_CHECKS if world_size in (2, 4) else ())
     _run(world_size, _checks(*checks), "nccl")
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_shared_input_dense_fallbacks_nccl(world_size):
+    _requires_sm100f()
+    _run(world_size, _checks(_logic_shared_input_dense_fallbacks), "nccl")
 
 
 if __name__ == "__main__":

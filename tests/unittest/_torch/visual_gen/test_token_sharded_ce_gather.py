@@ -438,3 +438,112 @@ def test_state_on_gloo(world_size, tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("batch,seq,tp", [(1, 8, 2), (2, 5, 3), (1, 5, 4), (3, 7, 4)])
+def test_shared_op_one_exchange_all_readers_before_release(batch, seq, tp, monkeypatch):
+    from types import SimpleNamespace
+
+    plan = TokenShardPlan.build(batch, seq, tp, 0)
+    m, k = plan.local_rows, 128
+    full = (
+        (torch.arange(plan.padded_rows) % 7)
+        .to(torch.float8_e4m3fn)[:, None]
+        .expand(-1, k)
+        .contiguous()
+    )
+    weights = [torch.full((n, k), i + 1).to(torch.float8_e4m3fn) for i, n in enumerate((8, 16, 24))]
+    scales = [_packed_weight_scale(w.shape[0], k) for w in weights]
+    events = []
+    current = []
+
+    class Transport:
+        rank, tp_size = 0, tp
+        consume_order = list(range(1, tp))
+
+        def issue(self, x, sf, slot):
+            events.append("issue")
+            assert torch.equal(x.float(), full[:m].float())
+
+        def chunk(self, src, slot):
+            assert not current or current[-1] == len(weights)
+            current.append(0)
+            events.append(("chunk", src))
+            return full[src * m : (src + 1) * m], None
+
+        def done(self, slot):
+            assert current == [len(weights)] * tp
+            events.append("done")
+
+        def reset(self):
+            events.append("reset")
+
+    def gemm(x, sf, w, ws, out):
+        current[-1] += 1
+        out.copy_(x.to(torch.bfloat16) @ w.to(torch.bfloat16).t())
+
+    monkeypatch.setattr(
+        tsc, "get_state", lambda group: SimpleNamespace(transport=Transport(), next_slot=lambda: 0)
+    )
+    monkeypatch.setattr(tsc, "fp8_block_gemm_out", gemm)
+    sf = torch.zeros(m, fp8_scale_cols(k), dtype=torch.int32)
+    result = tsc.ce_gather_gemms_impl(
+        full[:m], sf, weights, scales, "cpu", 0, tp, batch, seq, plan.padded_seq_len
+    )
+    for out, w in zip(result, weights):
+        expected = drop_padding(
+            full.to(torch.bfloat16) @ w.to(torch.bfloat16).t(), batch, seq, plan.padded_seq_len
+        )
+        assert torch.equal(out, expected) and out.is_contiguous()
+    assert events == ["issue"] + [("chunk", src) for src in range(tp)] + ["done"]
+    # Reject a later incompatible consumer before any rank starts its exchange.
+    events.clear()
+    bad = torch.zeros(8, k * 2, dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="expected this rank"):
+        tsc.ce_gather_gemms_impl(
+            full[:m],
+            sf,
+            [weights[0], bad],
+            scales[:2],
+            "cpu",
+            0,
+            tp,
+            batch,
+            seq,
+            plan.padded_seq_len,
+        )
+    assert events == []
+
+    # A failure after one reader has consumed a chunk must release through reset(), not done().
+    current.clear()
+
+    def failing_gemm(x, sf, w, ws, out):
+        if len(current) == 2 and current[-1] == 1:
+            raise RuntimeError("injected second-consumer failure")
+        gemm(x, sf, w, ws, out)
+
+    monkeypatch.setattr(tsc, "fp8_block_gemm_out", failing_gemm)
+    with pytest.raises(RuntimeError, match="injected"):
+        tsc.ce_gather_gemms_impl(
+            full[:m], sf, weights, scales, "cpu", 0, tp, batch, seq, plan.padded_seq_len
+        )
+    assert events[-1] == "reset" and "done" not in events
+
+
+def test_shared_op_fake_and_export():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    op = torch.ops.trtllm.token_sharded_fp8_ce_gather_gemms
+
+    class Boundary(torch.nn.Module):
+        def forward(self, x, sf, w, ws, w2, ws2):
+            return op(x, sf, [w, w2], [ws, ws2], "tp", 0, 2, 2, 5, 6)
+
+    with FakeTensorMode():
+        x, sf, w, ws = _op_inputs(6, 256, 128)
+        _, _, w2, ws2 = _op_inputs(6, 256, 256)
+        outputs = Boundary()(x, sf, w, ws, w2, ws2)
+    assert [tuple(t.shape) for t in outputs] == [(10, 128), (10, 256)]
+    args = (*_op_inputs(6, 256, 128), *_op_inputs(6, 256, 256)[2:])
+    exported = torch.export.export(Boundary(), args)
+    assert sum(node.target is op.default for node in exported.graph.nodes) == 1
